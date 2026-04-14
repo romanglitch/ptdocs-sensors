@@ -2,7 +2,7 @@ const express = require("express");
 const noble   = require("@abandonware/noble");
 
 const app  = express();
-const PORT = 3000;
+const PORT = 4200;
 
 const FLOWER_CARE = {
     serviceUUID:     "1204",
@@ -22,45 +22,6 @@ const CONNECT_TIMEOUT_MS   = 10000;
 const DISCOVERY_TIMEOUT_MS = 10000;
 const RETRY_DELAY_MS       = 2000;
 const MAX_ATTEMPTS         = 4;
-
-// ─────────────────────────────────────────────
-// Мьютекс на BLE-адаптер (только scan vs connect/discovery)
-// Два разных peripheral можно опрашивать параллельно,
-// но scan и connect/discovery нельзя запускать одновременно
-// ─────────────────────────────────────────────
-let adapterBusy = false;
-const adapterQueue = [];
-
-function acquireAdapter() {
-    return new Promise((resolve) => {
-        if (!adapterBusy) {
-            adapterBusy = true;
-            return resolve();
-        }
-        adapterQueue.push(resolve);
-    });
-}
-
-function releaseAdapter() {
-    if (adapterQueue.length > 0) {
-        adapterQueue.shift()();
-    } else {
-        adapterBusy = false;
-    }
-}
-
-// ─────────────────────────────────────────────
-// Отдельные мьютексы на каждое устройство
-// Гарантируют что к одному peripheral не идут
-// два параллельных GATT-запроса
-// ─────────────────────────────────────────────
-function makeDeviceLock() {
-    let queue = Promise.resolve();
-    return (fn) => {
-        queue = queue.then(() => fn()).catch(() => fn());
-        return queue;
-    };
-}
 
 // ─────────────────────────────────────────────
 // Вспомогательные функции
@@ -85,10 +46,10 @@ function sleep(ms) {
 }
 
 /**
- * Ключевое ускорение №1: подключаемся к устройству как только оно найдено,
- * не дожидаясь остальных. Каждый target получает свой колбэк onFound.
+ * Сканирует BLE-устройства и возвращает найденные peripheral по ключам.
+ * Останавливает сканирование когда все targets найдены или вышел таймаут.
  */
-function scanAndConnectEarly(targets, timeoutMs) {
+function scanForTargets(targets, timeoutMs) {
     return new Promise((resolve, reject) => {
         const found = {};
         let scanning = true;
@@ -110,8 +71,6 @@ function scanAndConnectEarly(targets, timeoutMs) {
                 if (!found[target.key] && target.names.some((n) => localName.includes(n))) {
                     console.log(`[SCAN] Найдено: ${localName} (${peripheral.address})`);
                     found[target.key] = peripheral;
-                    // Сразу сообщаем нашедшему — он может начинать connect
-                    target.onFound(peripheral);
                     tryStop();
                 }
             }
@@ -127,10 +86,6 @@ function scanAndConnectEarly(targets, timeoutMs) {
             if (Object.keys(found).length === 0) {
                 reject(new Error("Устройства не найдены за отведённое время"));
             } else {
-                // Уведомляем тех кто не нашёлся — они получат null
-                for (const t of targets) {
-                    if (!found[t.key]) t.onFound(null);
-                }
                 resolve(found);
             }
         }, timeoutMs);
@@ -245,160 +200,135 @@ async function withRetry(label, peripheral, fn) {
 // ─────────────────────────────────────────────
 // Опрос Flower Care
 // ─────────────────────────────────────────────
-async function readFlowerCare(peripheral, deviceLock) {
-    return withRetry("FlowerCare", peripheral, () =>
-        deviceLock(async () => {
-            // Ключевое ускорение №2: scan уже остановлен к этому моменту,
-            // захватываем адаптер только на время connect+discovery
-            await acquireAdapter();
-            try {
-                console.log("[FlowerCare] Подключение...");
-                await connectWithTimeout(peripheral, CONNECT_TIMEOUT_MS);
-                console.log("[FlowerCare] Подключено");
-            } finally {
-                // Отпускаем адаптер сразу после connect —
-                // GATT-операции уже не мешают параллельному connect другого устройства
-                releaseAdapter();
-            }
+async function readFlowerCare(peripheral) {
+    return withRetry("FlowerCare", peripheral, async () => {
+        console.log("[FlowerCare] Подключение...");
+        await connectWithTimeout(peripheral, CONNECT_TIMEOUT_MS);
+        console.log("[FlowerCare] Подключено");
 
-            try {
-                const chars = await discoverCharacteristics(
-                    peripheral,
-                    FLOWER_CARE.serviceUUID,
-                    [FLOWER_CARE.modeCharUUID, FLOWER_CARE.dataCharUUID, FLOWER_CARE.firmwareCharUUID]
-                );
+        try {
+            const chars = await discoverCharacteristics(
+                peripheral,
+                FLOWER_CARE.serviceUUID,
+                [FLOWER_CARE.modeCharUUID, FLOWER_CARE.dataCharUUID, FLOWER_CARE.firmwareCharUUID]
+            );
 
-                const modeChar = chars[FLOWER_CARE.modeCharUUID];
-                const dataChar = chars[FLOWER_CARE.dataCharUUID];
-                const fwChar   = chars[FLOWER_CARE.firmwareCharUUID];
+            const modeChar = chars[FLOWER_CARE.modeCharUUID];
+            const dataChar = chars[FLOWER_CARE.dataCharUUID];
+            const fwChar   = chars[FLOWER_CARE.firmwareCharUUID];
 
-                if (!modeChar || !dataChar || !fwChar)
-                    throw new Error("Не все характеристики найдены");
+            if (!modeChar || !dataChar || !fwChar)
+                throw new Error("Не все характеристики найдены");
 
-                await writeCharacteristic(modeChar, FLOWER_CARE.realTimeModeCmd, false);
+            await writeCharacteristic(modeChar, FLOWER_CARE.realTimeModeCmd, false);
 
-                // Ключевое ускорение №3: пока датчик переключается (600ms),
-                // параллельно читаем firmware — она не зависит от режима
-                const [, fwRaw] = await Promise.all([
-                    sleep(600),
-                    readCharacteristic(fwChar),
-                ]);
+            const [, fwRaw] = await Promise.all([
+                sleep(600),
+                readCharacteristic(fwChar),
+            ]);
 
-                const raw = await readCharacteristic(dataChar);
+            const raw = await readCharacteristic(dataChar);
 
-                return {
-                    temperature: raw.readUInt16LE(0) / 10,
-                    lux:         raw.readUInt32LE(3),
-                    moisture:    raw.readUInt8(7),
-                    fertility:   raw.readUInt16LE(8),
-                    battery:     fwRaw.readUInt8(0),
-                    firmware:    fwRaw.slice(2).toString("ascii").replace(/\0/g, ""),
-                };
-            } finally {
-                await disconnect(peripheral);
-                console.log("[FlowerCare] Отключено");
-            }
-        })
-    );
+            return {
+                temperature: raw.readUInt16LE(0) / 10,
+                lux:         raw.readUInt32LE(3),
+                moisture:    raw.readUInt8(7),
+                fertility:   raw.readUInt16LE(8),
+                battery:     fwRaw.readUInt8(0),
+                firmware:    fwRaw.slice(2).toString("ascii").replace(/\0/g, ""),
+            };
+        } finally {
+            await disconnect(peripheral);
+            console.log("[FlowerCare] Отключено");
+        }
+    });
 }
 
 // ─────────────────────────────────────────────
 // Опрос Mi Temp & Humidity Monitor
 // ─────────────────────────────────────────────
-async function readMiTemp(peripheral, deviceLock) {
-    return withRetry("MiTemp", peripheral, () =>
-        deviceLock(async () => {
-            await acquireAdapter();
-            try {
-                console.log("[MiTemp] Подключение...");
-                await connectWithTimeout(peripheral, CONNECT_TIMEOUT_MS);
-                console.log("[MiTemp] Подключено");
-            } finally {
-                releaseAdapter();
-            }
+async function readMiTemp(peripheral) {
+    return withRetry("MiTemp", peripheral, async () => {
+        console.log("[MiTemp] Подключение...");
+        await connectWithTimeout(peripheral, CONNECT_TIMEOUT_MS);
+        console.log("[MiTemp] Подключено");
 
-            try {
-                const chars = await discoverCharacteristics(
-                    peripheral,
-                    MI_TEMP.serviceUUID,
-                    [MI_TEMP.dataCharUUID]
-                );
+        try {
+            const chars = await discoverCharacteristics(
+                peripheral,
+                MI_TEMP.serviceUUID,
+                [MI_TEMP.dataCharUUID]
+            );
 
-                const key      = MI_TEMP.dataCharUUID.replace(/-/g, "");
-                const dataChar = chars[key];
-                if (!dataChar) throw new Error("dataChar не найден");
+            const key      = MI_TEMP.dataCharUUID.replace(/-/g, "");
+            const dataChar = chars[key];
+            if (!dataChar) throw new Error("dataChar не найден");
 
-                const raw     = await readCharacteristic(dataChar);
-                const voltage = raw.readUInt16LE(3) / 1000;
+            const raw     = await readCharacteristic(dataChar);
+            const voltage = raw.readUInt16LE(3) / 1000;
 
-                return {
-                    temperature: raw.readInt16LE(0) / 100,
-                    humidity:    raw.readUInt8(2),
-                    voltage,
-                    battery: Math.min(100, Math.max(0, Math.round((voltage - 2.1) * 100))),
-                };
-            } finally {
-                await disconnect(peripheral);
-                console.log("[MiTemp] Отключено");
-            }
-        })
-    );
+            return {
+                temperature: raw.readInt16LE(0) / 100,
+                humidity:    raw.readUInt8(2),
+                voltage,
+                battery: Math.min(100, Math.max(0, Math.round((voltage - 2.1) * 100))),
+            };
+        } finally {
+            await disconnect(peripheral);
+            console.log("[MiTemp] Отключено");
+        }
+    });
 }
+
 // ─────────────────────────────────────────────
-// GET /sensors
+// GET /
 // ─────────────────────────────────────────────
-app.get("/sensors", async (req, res) => {
+app.get("/", async (req, res) => {
     const result = { flowerCare: null, miTemp: null, errors: [] };
 
     try {
         await waitForBluetooth();
         console.log("[SCAN] Начинаем сканирование...");
 
-        // Промисы для каждого устройства — resolve вызовется как только
-        // устройство найдено при сканировании, не дожидаясь остальных
-        let resolveFlower, resolveMiTemp;
-        const flowerFound = new Promise((r) => (resolveFlower = r));
-        const miTempFound = new Promise((r) => (resolveMiTemp = r));
-
-        // Мьютексы уровня устройства — изолируют GATT двух устройств друг от друга
-        const flowerLock = makeDeviceLock();
-        const miTempLock = makeDeviceLock();
-
-        // Запускаем опрос каждого устройства сразу при обнаружении,
-        // не дожидаясь окончания сканирования
-        const flowerPromise = flowerFound.then((peripheral) => {
-            if (!peripheral) {
-                result.errors.push("FlowerCare: устройство не найдено");
-                return;
-            }
-            return readFlowerCare(peripheral, flowerLock)
-                .then((data) => { result.flowerCare = data; })
-                .catch((e) => { result.errors.push(`FlowerCare: ${e.message}`); });
-        });
-
-        const miTempPromise = miTempFound.then((peripheral) => {
-            if (!peripheral) {
-                result.errors.push("MiTemp: устройство не найдено");
-                return;
-            }
-            return readMiTemp(peripheral, miTempLock)
-                .then((data) => { result.miTemp = data; })
-                .catch((e) => { result.errors.push(`MiTemp: ${e.message}`); });
-        });
-
         const targets = [
-            { key: "flowerCare", names: ["Flower care", "Flower Care", "MiFlora"], onFound: resolveFlower },
-            { key: "miTemp",     names: ["LYWSD03MMC", "MJ_HT_V1", "ClearGrass"], onFound: resolveMiTemp },
+            { key: "flowerCare", names: ["Flower care", "Flower Care", "MiFlora"] },
+            { key: "miTemp",     names: ["LYWSD03MMC", "MJ_HT_V1", "ClearGrass"] },
         ];
 
-        // Сканирование и опрос идут параллельно:
-        // scan находит устройство → сразу начинается connect+read
-        await scanAndConnectEarly(targets, SCAN_TIMEOUT_MS);
+        // Сначала сканируем — ждём пока найдём оба устройства (или выйдет таймаут)
+        const found = await scanForTargets(targets, SCAN_TIMEOUT_MS);
+        console.log("[SCAN] Сканирование завершено, начинаем опрос устройств...");
 
-        // Ждём завершения обоих опросов
-        await Promise.all([flowerPromise, miTempPromise]);
+        // Последовательный опрос: сначала FlowerCare, потом MiTemp
+        if (found.flowerCare) {
+            console.log("[FLOW] Опрашиваем FlowerCare...");
+            try {
+                result.flowerCare = await readFlowerCare(found.flowerCare);
+                console.log("[FLOW] FlowerCare успешно опрошен");
+            } catch (e) {
+                result.errors.push(`FlowerCare: ${e.message}`);
+                console.error("[FLOW] Ошибка FlowerCare:", e.message);
+            }
+        } else {
+            result.errors.push("FlowerCare: устройство не найдено");
+        }
 
+        if (found.miTemp) {
+            console.log("[FLOW] Опрашиваем MiTemp...");
+            try {
+                result.miTemp = await readMiTemp(found.miTemp);
+                console.log("[FLOW] MiTemp успешно опрошен");
+            } catch (e) {
+                result.errors.push(`MiTemp: ${e.message}`);
+                console.error("[FLOW] Ошибка MiTemp:", e.message);
+            }
+        } else {
+            result.errors.push("MiTemp: устройство не найдено");
+        }
+
+        // Оба устройства опрошены — возвращаем результат
         res.json({ success: true, data: result });
+
     } catch (err) {
         console.error("[ERROR]", err.message);
         res.status(500).json({ success: false, error: err.message });
@@ -408,5 +338,5 @@ app.get("/sensors", async (req, res) => {
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`Сервер запущен: http://localhost:${PORT}`);
-    console.log(`Запрос данных: GET http://localhost:${PORT}/sensors`);
+    console.log(`Запрос данных: GET http://localhost:${PORT}`);
 });
